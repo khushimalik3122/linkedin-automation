@@ -54,7 +54,7 @@ def main() -> None:
         raise EnvironmentError("GEMINI_API_KEY environment variable is not set.")
 
     # Default model is gemini-2.5-flash (free tier friendly + supports Google Search grounding)
-    model = os.environ.get("GEMINI_MODEL") or "gemini-2.5-flash"
+    model = os.environ.get("GEMINI_MODEL") or "gemini-3.8-flash"
     now_ist = get_ist_now()
     weekday = now_ist.weekday()
     day_name = now_ist.strftime("%A")
