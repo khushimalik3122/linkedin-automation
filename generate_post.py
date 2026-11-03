@@ -2,7 +2,7 @@ import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from google import genai
-from google.genai import types
+from google.genai import errors, types
 
 # Topic schedule mapped by Python weekday integer (0 = Monday, 2 = Wednesday, 4 = Friday)
 WEEKDAY_TOPICS = {
@@ -12,6 +12,20 @@ WEEKDAY_TOPICS = {
 }
 
 DEFAULT_TOPIC = "General Brand Insight: Share a research-backed perspective relevant to LELNOB's core audience."
+
+# Prioritized fallback list of active Gemini text models
+DEFAULT_FALLBACK_MODELS = [
+    "gemini-3.8-flash",
+    "gemini-3.7-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
+    "gemini-flash-latest",
+    "gemini-3-flash-preview",
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+    "gemini-flash-lite-latest",
+    "gemini-2.5-flash-lite",
+]
 
 
 def get_ist_now() -> datetime:
@@ -48,13 +62,111 @@ def extract_grounding_sources(response) -> str:
     return "\n".join(sources)
 
 
+def get_candidate_models(client: genai.Client) -> list[str]:
+    """Build a deduplicated list of preset and dynamically discovered models."""
+    env_model = (os.environ.get("GEMINI_MODEL") or "").strip()
+    candidates = []
+
+    if env_model:
+        candidates.append(env_model)
+
+    for m in DEFAULT_FALLBACK_MODELS:
+        if m not in candidates:
+            candidates.append(m)
+
+    # Dynamically fetch models supported by this specific API key as backup
+    try:
+        skip_keywords = (
+            "tts",
+            "live",
+            "image",
+            "banana",
+            "transcribe",
+            "embedding",
+            "lyria",
+            "robotics",
+            "omni",
+            "gemma",
+            "argon",
+        )
+        for m in client.models.list():
+            name = (getattr(m, "name", "") or "").replace("models/", "")
+            supported = getattr(m, "supported_actions", []) or []
+            if (
+                name
+                and "generateContent" in supported
+                and not any(k in name.lower() for k in skip_keywords)
+                and name not in candidates
+            ):
+                candidates.append(name)
+    except Exception as e:
+        print(f"⚠️ Could not dynamically list models: {e}")
+
+    return candidates
+
+
+def generate_post_with_fallback(
+    client: genai.Client, user_input: str, system_instructions: str
+) -> tuple[object, str]:
+    """Try models in order; fall back across models and grounding settings if needed."""
+    candidate_models = get_candidate_models(client)
+    last_error = None
+
+    grounded_config = types.GenerateContentConfig(
+        system_instruction=system_instructions,
+        tools=[types.Tool(google_search=types.GoogleSearch())],
+        temperature=0.7,
+    )
+
+    ungrounded_config = types.GenerateContentConfig(
+        system_instruction=system_instructions,
+        temperature=0.7,
+    )
+
+    # Pass 1: Try candidate models WITH Google Search Grounding
+    for model_name in candidate_models:
+        try:
+            print(f"Trying model (with Google Search grounding): {model_name}...")
+            response = client.models.generate_content(
+                model=model_name,
+                contents=user_input,
+                config=grounded_config,
+            )
+            if response and getattr(response, "text", None):
+                print(f"✅ Successfully generated post using {model_name}")
+                return response, model_name
+        except errors.APIError as e:
+            print(f"⚠️ {model_name} (grounded) failed [{e.code}]: {e.message}")
+            last_error = e
+        except Exception as e:
+            print(f"⚠️ {model_name} (grounded) unexpected error: {e}")
+            last_error = e
+
+    # Pass 2: If grounding tool caused failures across models, retry WITHOUT Google Search tool
+    print("🔄 Grounded calls failed. Retrying candidate models without search tool...")
+    for model_name in candidate_models:
+        try:
+            print(f"Trying model (standard generation): {model_name}...")
+            response = client.models.generate_content(
+                model=model_name,
+                contents=user_input,
+                config=ungrounded_config,
+            )
+            if response and getattr(response, "text", None):
+                print(f"✅ Successfully generated post using {model_name} (ungrounded)")
+                return response, model_name
+        except Exception as e:
+            print(f"⚠️ {model_name} (ungrounded) failed: {e}")
+            last_error = e
+
+    raise RuntimeError(f"All Gemini fallback models failed. Last error: {last_error}")
+
+
 def main() -> None:
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         raise EnvironmentError("GEMINI_API_KEY environment variable is not set.")
 
-    # Default model is gemini-2.5-flash (free tier friendly + supports Google Search grounding)
-    model = os.environ.get("GEMINI_MODEL") or "gemini-3.8-flash"
     now_ist = get_ist_now()
     weekday = now_ist.weekday()
     day_name = now_ist.strftime("%A")
@@ -73,14 +185,10 @@ def main() -> None:
 
     client = genai.Client(api_key=api_key)
 
-    response = client.models.generate_content(
-        model=model,
-        contents=user_input,
-        config=types.GenerateContentConfig(
-            system_instruction=system_instructions,
-            tools=[types.Tool(google_search=types.GoogleSearch())],
-            temperature=0.7,
-        ),
+    response, used_model = generate_post_with_fallback(
+        client=client,
+        user_input=user_input,
+        system_instructions=system_instructions,
     )
 
     draft_text = (response.text or "").strip()
@@ -99,13 +207,13 @@ def main() -> None:
         f"brand: LELNOB\n"
         f"date: {date_str}\n"
         f"day: {day_name}\n"
-        f"model: {model}\n"
+        f"model: {used_model}\n"
         f"status: DRAFT_ONLY_REQUIRES_HUMAN_REVIEW\n"
         f"---\n\n"
     )
 
     output_file.write_text(header + draft_text + "\n", encoding="utf-8")
-    print(f"Saved draft to {output_file}")
+    print(f"Saved draft to {output_file} (generated with {used_model})")
 
 
 if __name__ == "__main__":
